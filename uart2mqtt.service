@@ -1,0 +1,16 @@
+[Unit]
+Description=UART to MQTT Bridge
+After=network.target
+
+[Service]
+ExecStart=uart2mqtt.py <mqtt_host> <mqtt_port> %H
+Restart=always
+User=your_user
+Group=your_group
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=uart2mqtt
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
