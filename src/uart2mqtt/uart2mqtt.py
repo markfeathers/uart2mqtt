@@ -13,7 +13,7 @@ class UART2MQTT:
     def __init__(self, mqtt_host, mqtt_port, mqtt_topic_base):
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
-        self.mqtt_topic_base = mqtt_topic_base
+        self.mqtt_topic_base = f'testbench/{mqtt_topic_base}'
         self.mqtt_client = mqtt.Client()
         self.serial_ports = {}
         self.stop_event = threading.Event()
