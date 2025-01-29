@@ -2,6 +2,7 @@ import os
 import paho.mqtt.client as mqtt
 import serial
 import threading
+import select
 import time
 import sys
 import logging
@@ -82,7 +83,7 @@ class UART2MQTT:
     def start_serial_thread(self, port):
         try:
             full_path = os.path.join(SERIAL_BASE_PATH, port)
-            serial_conn = serial.Serial(full_path, BAUD_RATE, timeout=1)
+            serial_conn = serial.Serial(full_path, BAUD_RATE, timeout=0)
             topic_base = f"testbench/{self.mqtt_topic_base}/{port}"
             serial_output_topic = f"{topic_base}/device_serial_output"
             serial_input_topic = f"{topic_base}/device_serial_input"
@@ -114,17 +115,21 @@ class UART2MQTT:
 
     def handle_serial(self, port, serial_conn, serial_output_topic):
         logger.info(f"Thread started for port: {port}")
+
         while not self.stop_event.is_set():
             try:
-                if serial_conn.in_waiting > 0:
-                    data = serial_conn.read(serial_conn.in_waiting)
-                    logger.debug(f"Serial read from {port}: {data}")
-                    self.mqtt_client.publish(serial_output_topic, data)
-                else:
-                    time.sleep(0.1)  # Avoid busy looping
+                # Use select to wait for data instead of polling
+                rlist, _, _ = select.select([serial_conn], [], [], 0.1) # 100ms timeout
+
+                if rlist:
+                    data = serial_conn.read(serial_conn.in_waiting or 1)
+                    if data:
+                        logger.debug(f"Serial read from {port}: {data}")
+                        self.mqtt_client.publish(serial_output_topic, data)
             except Exception as e:
                 logger.error(f"Error in thread for {port}: {e}")
                 break
+
         logger.info(f"Thread exiting for port: {port}")
 
     def stop(self):
