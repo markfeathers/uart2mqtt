@@ -18,15 +18,13 @@ classifiers = [
 ]
 license = {text = "MIT license"}
 dependencies = [
-  
+  "paho-mqtt",
+  "pyserial",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "coverage",  # testing
-    "mypy",  # linting
-    "pytest",  # testing
-    "ruff"  # linting
+  "mypy"
 ]
 
 [project.urls]
