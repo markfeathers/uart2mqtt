@@ -1,11 +1,15 @@
 import os
-import paho.mqtt.client as mqtt
-import serial
 import threading
 import select
 import time
 import sys
 import logging
+from typing import Any, Dict
+
+import serial
+from serial import Serial
+import paho.mqtt.client as mqtt
+from paho.mqtt.client import Client, MQTTMessage
 
 # Configure logging
 logging.basicConfig(
@@ -18,35 +22,68 @@ SERIAL_BASE_PATH = "/dev/serial/by-path"
 BAUD_RATE = 115200
 
 class UART2MQTT:
-    def __init__(self, mqtt_host, mqtt_port, mqtt_topic_base):
+    """Bidirectional bridge between USB-enumerated UART devices and MQTT topics.
+
+    The class continuously discovers USB-serial adapters under
+    ``/dev/serial/by-path``, streams their output to MQTT, and forwards MQTT
+    messages back to the corresponding serial port.  Every port gets two MQTT
+    topics:
+
+    * ``testbench/<mqtt_topic_base>/<port>/device_serial_output`` – data **from**
+      the device (UART → MQTT).
+    * ``testbench/<mqtt_topic_base>/<port>/device_serial_input`` – data **to**
+      the device (MQTT → UART).
+
+    Threads:
+        * One monitor thread watches the directory for new/removed devices.
+        * One thread per active serial port handles non-blocking IO.
+
+    Attributes
+    ----------
+    mqtt_host:
+        Hostname or IP address of the MQTT broker.
+    mqtt_port:
+        TCP port of the MQTT broker.
+    mqtt_topic_base:
+        Root topic segment under ``testbench/`` used when constructing per-port
+        topics.
+    mqtt_client:
+        Instance of :class:`paho.mqtt.client.Client`.
+    serial_ports:
+        Map ``{port_name: {"connection": Serial, "thread": Thread, ...}}`` for
+        all active devices.
+    stop_event:
+        Global flag signalling every thread to shut down.
+    """
+    def __init__(self, mqtt_host: str, mqtt_port: int, mqtt_topic_base: str):
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
         self.mqtt_topic_base = mqtt_topic_base
         self.mqtt_client = mqtt.Client()
-        self.serial_ports = {}
+        self.serial_ports: Dict[str, Dict[str, Any]] = {}
         self.stop_event = threading.Event()
 
-    def mqtt_connect(self):
-        def on_connect(client, userdata, flags, rc):
+    def mqtt_connect(self) -> None:
+        def on_connect(client: Client, _userdata: Any, _flags: Dict[str, Any], rc: int) -> None:
             if rc == 0:
                 logger.info("Connected to MQTT broker")
                 # Subscribe to the wildcard topic for serial input
                 client.subscribe(f"testbench/{self.mqtt_topic_base}/+/device_serial_input")
             else:
-                logger.error(f"MQTT connection failed with code {rc}")
+                logger.error(f"MQTT connection failed with code %d", rc)
 
-        def on_message(client, userdata, message):
+        def on_message(_client: Client, _userdata: Any, message: MQTTMessage) -> None:
             port_name = message.topic.split("/")[-2]  # Extract port name from the topic
             if port_name in self.serial_ports:
                 try:
                     # Write incoming data to the corresponding UART port
                     serial_conn = self.serial_ports[port_name]["connection"]
                     serial_conn.write(message.payload)
-                    logger.debug(f"Data written to {port_name}: {message.payload}")
+                    logger.debug("Data written to %s: %s", port_name, message.payload)
                 except Exception as e:
-                    logger.error(f"Error writing to UART {port_name}: {e}")
+                    logger.error("Error writing to UART %s: %s", port_name, e)
             else:
-                logger.warning(f"Port {port_name} not found for topic {message.topic}")
+                logger.warning("Port %s not found for topic %s", port_name, message.topic)
 
         self.mqtt_client.on_connect = on_connect
         self.mqtt_client.on_message = on_message
@@ -60,7 +97,7 @@ class UART2MQTT:
                 logger.error(f"Failed to connect to MQTT broker: {e}, retrying...")
                 time.sleep(3)
 
-    def monitor_serial_ports(self):
+    def monitor_serial_ports(self) -> None:
         while not self.stop_event.is_set():
             try:
                 available_ports = set(os.listdir(SERIAL_BASE_PATH))
@@ -80,7 +117,7 @@ class UART2MQTT:
             except Exception as e:
                 logger.error(f"Error monitoring serial ports: {e}")
 
-    def start_serial_thread(self, port):
+    def start_serial_thread(self, port: str) -> None:
         try:
             full_path = os.path.join(SERIAL_BASE_PATH, port)
             serial_conn = serial.Serial(full_path, BAUD_RATE, timeout=0)
@@ -105,7 +142,7 @@ class UART2MQTT:
         except Exception as e:
             logger.error(f"Failed to open {port}: {e}")
 
-    def stop_serial_thread(self, port):
+    def stop_serial_thread(self, port: str) -> None:
         try:
             self.serial_ports[port]["connection"].close()
             self.serial_ports.pop(port, None)
@@ -113,7 +150,7 @@ class UART2MQTT:
         except Exception as e:
             logger.error(f"Error stopping {port}: {e}")
 
-    def handle_serial(self, port, serial_conn, serial_output_topic):
+    def handle_serial(self, port: str, serial_conn: Serial, serial_output_topic: str) -> None:
         logger.info(f"Thread started for port: {port}")
 
         while not self.stop_event.is_set():
@@ -124,22 +161,22 @@ class UART2MQTT:
                 if rlist:
                     data = serial_conn.read(serial_conn.in_waiting or 1)
                     if data:
-                        logger.debug(f"Serial read from {port}: {data}")
+                        logger.debug("Serial read from %s: %s", port, data)
                         self.mqtt_client.publish(serial_output_topic, data)
             except Exception as e:
                 logger.error(f"Error in thread for {port}: {e}")
                 break
 
-        logger.info(f"Thread exiting for port: {port}")
+        logger.info("Thread exiting for port: %s", port)
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_event.set()
         for port in list(self.serial_ports.keys()):
             self.stop_serial_thread(port)
         self.mqtt_client.loop_stop()
         self.mqtt_client.disconnect()
 
-    def run(self):
+    def run(self) -> None:
         self.mqtt_connect()
 
         try:
@@ -154,12 +191,14 @@ class UART2MQTT:
         finally:
             self.stop()
 
-def main():
+def main() -> int:
     if len(sys.argv) < 4:
         print("Usage: python uart2mqtt <mqtt_host> <mqtt_port> <mqtt_topic_base>")
+        return 1
     else:
         mqtt_host = sys.argv[1]
         mqtt_port = int(sys.argv[2])
         mqtt_topic_base = sys.argv[3]
         uart2mqtt = UART2MQTT(mqtt_host, mqtt_port, mqtt_topic_base)
         uart2mqtt.run()
+        return 0
