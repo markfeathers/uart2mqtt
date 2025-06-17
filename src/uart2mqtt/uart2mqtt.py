@@ -4,22 +4,98 @@ import select
 import time
 import sys
 import logging
-from typing import Any, Dict
+from dataclasses import dataclass
+from pathlib import Path
+import tomllib as toml
+from typing import Any, Dict, List, Tuple
 
 import serial
 from serial import Serial
 import paho.mqtt.client as mqtt
 from paho.mqtt.client import Client, MQTTMessage
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="[%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+CONFIG_FILE = Path("/etc/uart2mqtt.toml")
+
 SERIAL_BASE_PATH = "/dev/serial/by-path"
 BAUD_RATE = 115200
+
+@dataclass(frozen=True, slots=True)
+class MqttCfg:
+    host: str
+    port: int
+    topic_base: str
+
+@dataclass(frozen=True, slots=True)
+class Cfg:
+    mqtt      : MqttCfg
+    usb_match : List[Tuple[str, str]] | None
+
+def load_config(path: Path) -> Cfg:
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with path.open("rb") as fp:
+        raw = toml.load(fp)
+
+    # ---------- MQTT ----------
+    mqtt_raw = raw.get("mqtt", {})
+    mqtt_cfg = MqttCfg(
+        host       = mqtt_raw.get("host", "localhost"),
+        port       = int(mqtt_raw.get("port", 1883)),
+        topic_base = str(mqtt_raw.get("topic_base", "testbench")),
+    )
+
+    # ---------- USB allow‑list ----------
+    usb_match_raw = raw.get("usb_match")
+    allow: list[tuple[str, str]] | None = None
+
+    if usb_match_raw:
+        allow = []
+        for entry in usb_match_raw:
+            vid = str(entry.get("vid", "*")).lower()
+            pid = str(entry.get("pid", "*")).lower()
+            allow.append((vid, pid))
+
+    return Cfg(mqtt=mqtt_cfg, usb_match=allow)
+
+def vid_pid_from_symlink(symlink: Path) -> tuple[str, str] | None:
+    try:
+        real_tty   = Path(os.path.realpath(symlink))
+        tty_name   = real_tty.name
+        sys_tty    = Path("/sys/class/tty") / tty_name / "device"
+        dev_path   = sys_tty.resolve()
+
+        # Handle 2 channel devices
+        for _ in range(3):
+            vid_file = dev_path / "idVendor"
+            pid_file = dev_path / "idProduct"
+            if vid_file.exists() and pid_file.exists():
+                vid = vid_file.read_text().strip().lower()
+                pid = pid_file.read_text().strip().lower()
+                return vid, pid
+            dev_path = dev_path.parent
+
+        logger.warning(f"No VID:PID found for {symlink} after walking sysfs")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to resolve VID:PID for {symlink}: {e}")
+        return None
+
+def usb_allowed(vid: str, pid: str, allow: List[Tuple[str, str]] | None) -> bool:
+    """Return True if (vid,pid) is permitted by the list."""
+    if allow is None:
+        return True  # “match everything”
+    for v, p in allow:
+        if (v in ("*", vid)) and (p in ("*", pid)):
+            return True
+    return False
+
 
 class UART2MQTT:
     """Bidirectional bridge between USB-enumerated UART devices and MQTT topics.
@@ -45,7 +121,7 @@ class UART2MQTT:
     mqtt_port:
         TCP port of the MQTT broker.
     mqtt_topic_base:
-        Root topic segment under ``testbench/`` used when constructing per-port
+        Root topic segment under ``/`` used when constructing per-port
         topics.
     mqtt_client:
         Instance of :class:`paho.mqtt.client.Client`.
@@ -55,22 +131,21 @@ class UART2MQTT:
     stop_event:
         Global flag signalling every thread to shut down.
     """
-    def __init__(self, mqtt_host: str, mqtt_port: int, mqtt_topic_base: str):
-        self.mqtt_host = mqtt_host
-        self.mqtt_port = mqtt_port
-        self.mqtt_topic_base = mqtt_topic_base
+    def __init__(self, cfg: Cfg) -> None:
+        self.cfg = cfg
         self.mqtt_client = mqtt.Client()
         self.serial_ports: Dict[str, Dict[str, Any]] = {}
+        self.ignored_ports: set[str] = set()
+        self.opened_real_devices: set[str] = set()
         self.stop_event = threading.Event()
 
     def mqtt_connect(self) -> None:
         def on_connect(client: Client, _userdata: Any, _flags: Dict[str, Any], rc: int) -> None:
             if rc == 0:
                 logger.info("Connected to MQTT broker")
-                # Subscribe to the wildcard topic for serial input
-                client.subscribe(f"testbench/{self.mqtt_topic_base}/+/device_serial_input")
+                client.subscribe(f"/{self.cfg.mqtt.topic_base}/+/device_serial_input")
             else:
-                logger.error(f"MQTT connection failed with code %d", rc)
+                logger.error("MQTT connection failed with code %d", rc)
 
         def on_message(_client: Client, _userdata: Any, message: MQTTMessage) -> None:
             port_name = message.topic.split("/")[-2]  # Extract port name from the topic
@@ -90,7 +165,7 @@ class UART2MQTT:
 
         while not self.stop_event.is_set():
             try:
-                self.mqtt_client.connect(self.mqtt_host, self.mqtt_port)
+                self.mqtt_client.connect(self.cfg.mqtt.host, self.cfg.mqtt.port)
                 self.mqtt_client.loop_start()
                 return
             except Exception as e:
@@ -100,20 +175,53 @@ class UART2MQTT:
     def monitor_serial_ports(self) -> None:
         while not self.stop_event.is_set():
             try:
-                available_ports = set(os.listdir(SERIAL_BASE_PATH))
+                available_ports = set(sorted(os.listdir(SERIAL_BASE_PATH), key=lambda p: (not p.startswith("usbv2"), p)))
                 current_ports = set(self.serial_ports.keys())
 
-                # Add new ports
-                for port in available_ports - current_ports:
-                    logger.info(f"New serial port detected: {port}")
-                    self.start_serial_thread(port)
+                # Handle new ports
+                for port in available_ports - current_ports - self.ignored_ports:
+                    full_path = Path(SERIAL_BASE_PATH) / port
+                    real_dev_path = os.path.realpath(full_path)
+
+                    if real_dev_path in self.opened_real_devices:
+                        logger.debug(f"Skipping duplicate symlink {port} → {real_dev_path}")
+                        self.ignored_ports.add(port)
+                        continue
+
+                    vid_pid = vid_pid_from_symlink(full_path)
+                    if vid_pid:
+                        vid, pid = vid_pid
+                        if usb_allowed(vid, pid, self.cfg.usb_match):
+                            logger.info(f"Opening Serial Port <{vid}:{pid}>({real_dev_path}): {port}")
+                            self.opened_real_devices.add(real_dev_path)
+                            self.start_serial_thread(port)
+                        else:
+                            logger.info(f"Ignoring Serial Port <{vid}:{pid}>: {port}")
+                            self.ignored_ports.add(port)
+                    else:
+                        logger.warning(f"Could not resolve VID:PID for {port}, ignoring")
+                        self.ignored_ports.add(port)
 
                 # Remove vanished ports
                 for port in current_ports - available_ports:
+                    full_path = Path(SERIAL_BASE_PATH) / port
+                    real_dev_path = os.path.realpath(full_path)
                     logger.info(f"Serial port removed: {port}")
                     self.stop_serial_thread(port)
+                    self.opened_real_devices.remove(real_dev_path)
+
+                for port in self.ignored_ports.copy():
+                    if port not in available_ports:
+                        self.ignored_ports.remove(port)
 
                 time.sleep(1)
+            except FileNotFoundError as e:
+                if e.filename == SERIAL_BASE_PATH:
+                    logger.warning(f"{SERIAL_BASE_PATH} not found, retrying in 1 second")
+                    time.sleep(1)
+                else:
+                    logger.error(f"Unexpected FileNotFoundError: {e}")
+                    time.sleep(1)
             except Exception as e:
                 logger.error(f"Error monitoring serial ports: {e}")
 
@@ -121,7 +229,7 @@ class UART2MQTT:
         try:
             full_path = os.path.join(SERIAL_BASE_PATH, port)
             serial_conn = serial.Serial(full_path, BAUD_RATE, timeout=0)
-            topic_base = f"testbench/{self.mqtt_topic_base}/{port}"
+            topic_base = f"/{self.cfg.mqtt.topic_base}/{port}"
             serial_output_topic = f"{topic_base}/device_serial_output"
             serial_input_topic = f"{topic_base}/device_serial_input"
 
@@ -138,21 +246,20 @@ class UART2MQTT:
                 "serial_input_topic": serial_input_topic
             }
             thread.start()
-            logger.info(f"Started monitoring serial port: {port}")
         except Exception as e:
-            logger.error(f"Failed to open {port}: {e}")
+            logger.error("Failed to open %s: %s", port, e)
 
     def stop_serial_thread(self, port: str) -> None:
         try:
+            thread = self.serial_ports[port]["thread"]
+            thread.join(timeout=2.0)  # Wait for thread to exit
             self.serial_ports[port]["connection"].close()
             self.serial_ports.pop(port, None)
-            logger.info(f"Stopped monitoring serial port: {port}")
+            logger.info("Stopped monitoring serial port: %s", port)
         except Exception as e:
-            logger.error(f"Error stopping {port}: {e}")
+            logger.error("Error stopping %s: %s", port, e)
 
     def handle_serial(self, port: str, serial_conn: Serial, serial_output_topic: str) -> None:
-        logger.info(f"Thread started for port: {port}")
-
         while not self.stop_event.is_set():
             try:
                 # Use select to wait for data instead of polling
@@ -164,7 +271,7 @@ class UART2MQTT:
                         logger.debug("Serial read from %s: %s", port, data)
                         self.mqtt_client.publish(serial_output_topic, data)
             except Exception as e:
-                logger.error(f"Error in thread for {port}: {e}")
+                logger.error("Error in thread for %s: %s", port, e)
                 break
 
         logger.info("Thread exiting for port: %s", port)
@@ -192,13 +299,17 @@ class UART2MQTT:
             self.stop()
 
 def main() -> int:
-    if len(sys.argv) < 4:
-        print("Usage: python uart2mqtt <mqtt_host> <mqtt_port> <mqtt_topic_base>")
+    """
+    Start the bridge using the TOML file that sits alongside uart2mqtt.py.
+
+    * If the file is missing or malformed we exit with code 1.
+    * If everything loads, control never returns until the program is stopped.
+    """
+    try:
+        cfg = load_config(CONFIG_FILE)
+    except Exception as e:           # FileNotFoundError, toml.TOMLDecodeError…
+        logger.error("Failed to load config %s: %s", CONFIG_FILE, e)
         return 1
-    else:
-        mqtt_host = sys.argv[1]
-        mqtt_port = int(sys.argv[2])
-        mqtt_topic_base = sys.argv[3]
-        uart2mqtt = UART2MQTT(mqtt_host, mqtt_port, mqtt_topic_base)
-        uart2mqtt.run()
-        return 0
+
+    UART2MQTT(cfg).run()
+    return 0
