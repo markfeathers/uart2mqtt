@@ -1,0 +1,20 @@
+# MQTT parameters
+[mqtt]
+host = "localhost"
+port = 1883
+topic_base = "testbench/serial"
+
+## By default, uart2mqtt matches all serial ports on a system, but this can
+## be limited with the usb_match list. This can specify one or more VID/PID 
+## to only match some devices. Eg, to match the FT232R/FT2232H
+#[[usb_match]]
+#vid = "0403"   # FTDI
+#pid = "6001"   # FT232RL
+#[[usb_match]]
+#vid = "0403"   # FTDI
+#pid = "6010"   # FT2232H
+
+## Default USB allow is everything, if not specified this is what we use:
+# [[usb_match]]
+# vid = "*"
+# pid = "*"
