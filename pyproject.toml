@@ -39,10 +39,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.package-data]
 "*" = ["*.*"]
 
-
 [project.scripts]
 uart2mqtt = "uart2mqtt.uart2mqtt:main"
-
 
 # Mypy
 # ----
@@ -54,10 +52,3 @@ files = "."
 strict = true
 warn_unreachable = true
 warn_no_return = true
-
-[[tool.mypy.overrides]]
-# Don't require test functions to include types
-module = "tests.*"
-allow_untyped_defs = true
-disable_error_code = "attr-defined"
-
