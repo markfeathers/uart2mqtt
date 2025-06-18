@@ -7,9 +7,6 @@ ExecStart=uart2mqtt
 Restart=always
 User=your_user
 Group=your_group
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=uart2mqtt
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
