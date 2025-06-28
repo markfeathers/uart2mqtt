@@ -259,22 +259,32 @@ class UART2MQTT:
         except Exception as e:
             logger.error("Error stopping %s: %s", port, e)
 
-    def handle_serial(self, port: str, serial_conn: Serial, serial_output_topic: str) -> None:
-        while not self.stop_event.is_set():
-            try:
-                # Use select to wait for data instead of polling
-                rlist, _, _ = select.select([serial_conn], [], [], 0.1) # 100ms timeout
 
+    def handle_serial(self, port: str,
+                    serial_conn: Serial,
+                    serial_output_topic: str) -> None:
+        try:
+            while not self.stop_event.is_set():
+                rlist, _, _ = select.select([serial_conn], [], [], 0.1)
                 if rlist:
                     data = serial_conn.read(serial_conn.in_waiting or 1)
                     if data:
-                        logger.debug("Serial read from %s: %s", port, data)
                         self.mqtt_client.publish(serial_output_topic, data)
-            except Exception as e:
-                logger.error("Error in thread for %s: %s", port, e)
-                break
 
-        logger.info("Thread exiting for port: %s", port)
+        except Exception as e:
+            logger.error("Error in thread for %s: %s", port, e)
+
+        finally:
+            try:
+                serial_conn.close()
+            except Exception:
+                pass
+
+            self.serial_ports.pop(port, None)
+            real_dev = os.path.realpath(serial_conn.port)
+            self.opened_real_devices.discard(real_dev)
+
+            logger.info("Thread exiting for port: %s", port)
 
     def stop(self) -> None:
         self.stop_event.set()
