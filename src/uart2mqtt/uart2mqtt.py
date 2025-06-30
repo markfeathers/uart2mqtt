@@ -121,8 +121,7 @@ class UART2MQTT:
     mqtt_port:
         TCP port of the MQTT broker.
     mqtt_topic_base:
-        Root topic segment under ``/`` used when constructing per-port
-        topics.
+        Root topic segment under used when constructing per-port topics.
     mqtt_client:
         Instance of :class:`paho.mqtt.client.Client`.
     serial_ports:
@@ -143,7 +142,7 @@ class UART2MQTT:
         def on_connect(client: Client, _userdata: Any, _flags: Dict[str, Any], rc: int) -> None:
             if rc == 0:
                 logger.info("Connected to MQTT broker")
-                client.subscribe(f"/{self.cfg.mqtt.topic_base}/+/device_serial_input")
+                client.subscribe(f"{self.cfg.mqtt.topic_base}/+/device_serial_input")
             else:
                 logger.error("MQTT connection failed with code %d", rc)
 
@@ -238,7 +237,7 @@ class UART2MQTT:
         try:
             full_path = os.path.join(SERIAL_BASE_PATH, port)
             serial_conn = serial.Serial(full_path, BAUD_RATE, timeout=0)
-            topic_base = f"/{self.cfg.mqtt.topic_base}/{port}"
+            topic_base = f"{self.cfg.mqtt.topic_base}/{port}"
             serial_output_topic = f"{topic_base}/device_serial_output"
             serial_input_topic = f"{topic_base}/device_serial_input"
 
