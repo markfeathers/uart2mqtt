@@ -97,12 +97,6 @@ def usb_allowed(vid: str, pid: str, allow: List[Tuple[str, str]] | None) -> bool
             return True
     return False
 
-def _wait_for_udev():
-    try:
-        subprocess.run(["udevadm", "settle", "-t", "2"], check=True)
-    except subprocess.CalledProcessError:
-        logger.warning("udevadm settle timed out")
-
 class UART2MQTT:
     """Bidirectional bridge between USB-enumerated UART devices and MQTT topics.
 
@@ -180,9 +174,23 @@ class UART2MQTT:
 
     def monitor_serial_ports(self) -> None:
         while not self.stop_event.is_set():
-            _wait_for_udev()
             try:
-                available_ports = set(sorted(os.listdir(SERIAL_BASE_PATH), key=lambda p: (not p.startswith("usbv2"), p)))
+                # List and sort the directory first (keeps your original ordering)
+                raw_ports = sorted(
+                    os.listdir(SERIAL_BASE_PATH),
+                    key=lambda p: (not p.startswith("usbv2"), p),
+                )
+
+                filtered_ports = []
+
+                # udev is going through a renaming process where they have 2 namespaces
+                # for usb.  Without this, we add the same devices multiple times.
+                for p in raw_ports:
+                    if "usb" in p and "usbv2" not in p:
+                        continue
+                    filtered_ports.append(p)
+
+                available_ports = set(filtered_ports)
                 current_ports = set(self.serial_ports.keys())
 
                 # Handle new ports
