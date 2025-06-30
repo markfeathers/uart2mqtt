@@ -175,18 +175,12 @@ class UART2MQTT:
     def monitor_serial_ports(self) -> None:
         while not self.stop_event.is_set():
             try:
-                # List and sort the directory first (keeps your original ordering)
-                raw_ports = sorted(
-                    os.listdir(SERIAL_BASE_PATH),
-                    key=lambda p: (not p.startswith("usbv2"), p),
-                )
-
                 filtered_ports = []
 
                 # udev is going through a renaming process where they have 2 namespaces
                 # for usb.  Without this, we add the same devices multiple times.
-                for p in raw_ports:
-                    if "usb" in p and "usbv2" not in p:
+                for p in os.listdir(SERIAL_BASE_PATH):
+                    if "usb" in p and "usbv2" in p:
                         continue
                     filtered_ports.append(p)
 
